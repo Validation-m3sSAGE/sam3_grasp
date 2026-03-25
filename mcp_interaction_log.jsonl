@@ -1,0 +1,8 @@
+{"timestamp": "2026-03-25T18:06:57.929475", "role": "assistant", "content": "调用目标检测指令: water bottle"}
+{"timestamp": "2026-03-25T18:06:58.850787", "role": "sam3_grasp_piper", "content": "目标 'water bottle' 已在视野中找到。"}
+{"timestamp": "2026-03-25T18:07:02.480977", "role": "assistant", "content": "调用抓取指令: water bottle"}
+{"timestamp": "2026-03-25T18:07:18.967595", "role": "sam3_grasp_piper", "content": "抓取完成，系统返回状态: {'success': True, 'action_completed': True}"}
+{"timestamp": "2026-03-25T18:11:30.289430", "role": "assistant", "content": "调用目标检测指令: water bottle"}
+{"timestamp": "2026-03-25T18:11:31.106856", "role": "sam3_grasp_piper", "content": "目标 'water bottle' 已在视野中找到。"}
+{"timestamp": "2026-03-25T18:11:35.701347", "role": "assistant", "content": "调用抓取指令: water bottle"}
+{"timestamp": "2026-03-25T18:11:52.184542", "role": "sam3_grasp_piper", "content": "抓取完成，系统返回状态: {'success': True, 'action_completed': True}"}

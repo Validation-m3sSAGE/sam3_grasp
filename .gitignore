@@ -1,6 +1,6 @@
 calibration_result_backup.npz
 mask_visualization.jpg
 sam3.pt
-__pycache__/
+*/__pycache__/
 /ros__fixed_long_ver/
-/sam3/
+

@@ -1,5 +1,57 @@
-calibration_result_backup.npz
+# ============================================================
+# SAM3 × Piper 抓取系统 — .gitignore
+# ============================================================
+
+# ---------- 模型权重（体积过大，请手动下载）----------
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# ---------- 手眼标定结果（机器专属，不应共享）----------
+calibration_result*.npz
+# 注：如需将初始标定文件纳入版本控制，可用 git add -f calibration_result.npz
+
+# ---------- 运行时调试输出 ----------
+debug_mask_rgb_overlay.jpg
+debug_raw_masked_pointcloud.ply
 mask_visualization.jpg
-sam3.pt
-*/__pycache__/
-/ros__fixed_long_ver/
+current_scene_pointcloud.ply
+mcp_interaction_log.jsonl
+vis_output/
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ---------- 虚拟环境 ----------
+.env
+.venv
+env/
+venv/
+ENV/
+
+# ---------- Conda 环境（若本地创建在项目目录内）----------
+conda-env/
+
+# ---------- 构建产物 ----------
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---------- IDE / 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---------- 系统垃圾 ----------
+.Trash-*/
+Thumbs.db

@@ -1,6 +1,6 @@
 # SAM3 × Piper 机械臂抓取系统
 
-基于 Meta SAM3（Segment Anything Model 3）视觉大模型与松灵 Piper 机械臂的**零样本语言驱动抓取系统**。系统通过文本描述定位目标物体，结合 Intel RealSense D405 深度相机完成三维坐标解算，驱动机械臂执行精准抓取。
+基于 Meta **SAM3**（Segment Anything Model 3）视觉大模型与松灵 **Piper** 机械臂的**零样本语言驱动抓取系统**。系统通过文本描述定位目标物体，结合 Intel RealSense D405 深度相机完成三维坐标解算，驱动机械臂执行精准抓取，并通过 **MCP（Model Context Protocol）** 将全部能力暴露为 AI Agent 可直接调用的工具。
 
 ---
 
@@ -15,9 +15,11 @@
 │  GraspManager (grasp_manager.py)                            │
 │       ├── PerceptionLayer (perception_layer.py)             │
 │       │       ├── RealSense D405 (pyrealsense2)             │
-│       │       └── HTTP → GPU 推理服务 (server_sam3.py)       │
+│       │       └── HTTP → SAM3 推理服务 (server_sam3.py)     │
 │       └── PiperArmControllerSDK (arm_controller_sdk.py)     │
-│               └── CAN 总线 (piper_sdk)                      │
+│               ├── CAN 总线 (piper_sdk)                      │
+│               └── OMPLKinematicsPlanner (ompl_planner.py)   │
+│                       └── PyBullet IK/FK 引擎               │
 └─────────────────────────────────────────────────────────────┘
                               │ HTTP :8000
 ┌─────────────────────────────────────────────────────────────┐
@@ -41,8 +43,10 @@
 |------|------|
 | **零样本分割** | 输入任意英文名词（如 `apple`、`bottle`），SAM3 自动定位并生成像素级掩码 |
 | **3D 坐标解算** | 将 2D 掩码与 D405 深度图融合，计算目标物体在相机坐标系下的三维重心 |
-| **手眼标定** | 双向多点 ICP 点云配准，自动计算相机系→机械臂基座系的旋转映射矩阵 |
-| **自动抓取** | 完整的预抓取→下放→夹取→复位动作链 |
+| **手眼标定** | 多位姿 AX=XB（Tsai-Lenz / Park-Martin）手眼标定，自动计算相机系→机械臂基座系的变换矩阵 |
+| **OMPL 运动规划** | 基于 PyBullet 物理引擎的 IK/FK 解算，将笛卡尔目标坐标映射为安全的关节空间轨迹 |
+| **自动抓取** | 完整的预抓取→下放→夹取→复位动作链，支持 45° 斜向下抓取姿态 |
+| **探索抓取** | 旋转扫描环境，发现目标后自动对准并执行抓取 |
 | **MCP 工具接口** | 通过 Model Context Protocol 将抓取能力暴露为 AI Agent 可调用的工具 |
 | **Agentic 分割** | 内置多轮 MLLM 推理 Agent，支持复杂指代表达的精确分割 |
 
@@ -57,12 +61,14 @@ SAM3/
 ├── server_sam3.py             # SAM3 GPU 推理 HTTP 服务
 ├── grasp_manager.py           # 抓取管理器（标定、感知、运动规划）
 ├── perception_layer.py        # 感知层（相机采集、掩码提取、点云处理）
-├── arm_controller_sdk.py      # 机械臂控制器（基于 piper_sdk）
+├── arm_controller_sdk.py      # 机械臂控制器（基于 piper_sdk + OMPL）
+├── ompl_planner.py            # PyBullet IK/FK 运动学规划器
 ├── launch_sam3_system.sh      # 一键启动脚本（CAN + 推理服务 + MCP）
 ├── can_activate.sh            # CAN 总线激活脚本
 ├── install.sh                 # 环境安装脚本
-├── calibration_result.npz     # 手眼标定矩阵（持久化存储）
-├── sam3.pt                    # SAM3 模型权重（需手动下载）
+├── setup.py                   # sam3 子包安装配置
+├── calibration_result.npz     # 手眼标定矩阵（运行后自动生成，不纳入版本控制）
+├── sam3.pt                    # SAM3 模型权重（需手动下载，不纳入版本控制）
 │
 ├── sam3/                      # SAM3 模型库（Meta 官方代码）
 │   ├── model_builder.py       # 模型构建入口
@@ -84,6 +90,9 @@ SAM3/
 │   ├── perflib/               # 高性能算子（Triton NMS、连通域等）
 │   └── sam/                   # SAM1 兼容组件
 │
+├── urdf/                      # Piper 机械臂 URDF 模型（供 PyBullet IK 使用）
+│   └── piper_description.urdf
+│
 └── ros__fixed_long_ver/       # 历史 ROS2 版本（已弃用，仅供参考）
 ```
 
@@ -91,38 +100,51 @@ SAM3/
 
 ## 快速开始
 
-### 1. 环境安装
+### 1. 克隆仓库
+
+```bash
+git clone <repo_url>
+cd SAM3
+```
+
+### 2. 环境安装
 
 ```bash
 bash install.sh
 ```
 
+> **前提**：已安装 [Miniconda/Anaconda](https://docs.conda.io/en/latest/miniconda.html) 和 NVIDIA GPU 驱动。
+
 安装完成后，手动下载模型权重并放置到项目根目录：
 
 ```bash
-# 方式一：从 HuggingFace 下载（代码中已内置自动下载逻辑）
-# 方式二：手动下载后放置
-cp /path/to/sam3.pt /home/ubuntu/sunqianran/SAM3/sam3.pt
+# 从 HuggingFace 下载
+huggingface-cli download facebook/sam3 sam3.pt --local-dir .
+# 或手动复制
+cp /path/to/sam3.pt ./sam3.pt
 ```
 
-### 2. 配置感知层服务器地址
+### 3. 配置感知层服务器地址
 
-编辑 `perception_layer.py`，将 `server_ip` 修改为运行 `server_sam3.py` 的 GPU 主机 IP：
+若推理服务（`server_sam3.py`）与控制端**不在同一台机器**，编辑 `perception_layer.py`：
 
 ```python
-# perception_layer.py 第 15 行
-server_ip: str = "127.0.0.1",   # ← 修改为 GPU 主机的局域网 IP
+# perception_layer.py 第 16 行
+server_ip: str = "127.0.0.1",   # ← 修改为运行 server_sam3.py 的 GPU 主机局域网 IP
 ```
 
-### 3. 启动推理服务（GPU 主机）
+### 4. 启动推理服务（GPU 主机）
 
 ```bash
 conda activate sam3_grasp
 python server_sam3.py
 # 服务将在 http://0.0.0.0:8000 监听
+
+# 可选：开启可视化（无显示器时自动保存到 vis_output/）
+python server_sam3.py --vis True
 ```
 
-### 4a. 直接运行（交互模式）
+### 5a. 直接运行（交互模式）
 
 ```bash
 conda activate sam3_grasp
@@ -133,14 +155,18 @@ python main.py
 交互菜单选项：
 
 ```
-1. 单次直接抓取   (grasp_simple)   — 输入目标名称，执行完整抓取
-2. 可视化当前点云 (visualize_scene) — Open3D 窗口渲染当前场景
-3. 执行手眼标定   (calibrate)      — 双向 ICP 全轴标定
-h. 机械臂回零
+1. 单次直接抓取   (grasp_simple)        — 输入目标名称，执行完整抓取
+2. 可视化当前点云 (visualize_scene)      — 保存当前场景点云到 .ply 文件
+3. 执行手眼标定   (calibrate)           — AX=XB 多位姿手眼标定
+4. 旋转探索并释放 (explore_and_place)   — 向左旋转寻找目标，在目标上方释放
+5. 旋转释放       (rotate_release)      — 旋转指定角度后释放夹持物体
+6. 旋转探索并抓取 (explore_and_grasp)   — 向右旋转寻找目标，发现后执行抓取
+7. 向右探索并释放 (explore_right_and_place) — 向右旋转寻找目标，在目标上方释放
+h. 机械臂回归标准俯视待机位姿
 q. 退出
 ```
 
-### 4b. CLI 模式
+### 5b. CLI 模式
 
 ```bash
 python main.py --mode grasp_simple --target apple
@@ -150,7 +176,7 @@ python main.py --mode visualize_scene
 python main.py --calib /path/to/calibration_result.npz --mode grasp_simple --target bottle
 ```
 
-### 4c. MCP Agent 模式（推荐）
+### 5c. MCP Agent 模式（推荐）
 
 通过 `launch_sam3_system.sh` 一键启动完整系统（CAN 激活 + 推理服务 + MCP 服务端）：
 
@@ -160,14 +186,27 @@ bash launch_sam3_system.sh
 
 该脚本会：
 1. 激活 CAN 总线
-2. 后台启动 `server_sam3.py`（等待 HTTP 服务就绪）
+2. 后台启动 `server_sam3.py`（等待 HTTP 服务就绪后再继续）
 3. 前台启动 `mcp_server.py`（接管 stdio，供 AI Agent 调用）
 
-在 OEA 或其他支持 MCP 的 AI Agent 中配置此工具后，可通过自然语言指令控制机械臂：
+在支持 MCP 的 AI Agent（如 OEA、Claude Desktop 等）中配置此工具后，可通过自然语言指令控制机械臂：
 
 > "帮我抓取桌上的苹果"  
 > "检查视野中是否有水瓶"  
-> "执行手眼标定"
+> "执行手眼标定"  
+> "把夹着的东西放到垃圾桶里"
+
+#### MCP 工具列表
+
+| 工具名 | 功能 |
+|--------|------|
+| `grasp_simple` | 直接抓取指定目标物体 |
+| `explore_and_grasp` | 向右旋转扫描，发现目标后执行抓取 |
+| `explore_and_place` | 向左旋转扫描，发现目标后在其上方释放 |
+| `explore_right_and_place` | 向右旋转扫描，发现目标后在其上方释放 |
+| `check_target` | 检查指定目标是否在当前视野中 |
+| `calibrate_axes` | 执行多位姿 AX=XB 手眼标定 |
+| `go_home` | 机械臂回归标准俯视待机位姿 |
 
 ---
 
@@ -175,10 +214,11 @@ bash launch_sam3_system.sh
 
 首次使用或抓取位置出现系统性偏移时，需执行手眼标定。
 
-**标定原理**：机械臂沿 X/Y/Z 三轴各做正负方向微动（默认 ±5cm），通过 Open3D ICP 点云配准计算相机坐标系下的位移向量，SVD 正交化后得到相机系→基座系的旋转矩阵 `R_cam2base`。
+**标定原理**：采用 **AX=XB（Park-Martin 非线性逼近）** 多位姿手眼标定算法（眼在手上，Eye-in-Hand）。机械臂在初始观测位姿附近自动采集 15 组随机扰动位姿，每个位姿下通过 OpenCV `solvePnP` 解算棋盘格在相机系下的 6D 位姿，同时读取机械臂正运动学末端矩阵，最终通过 `cv2.calibrateHandEye(method=CALIB_HAND_EYE_PARK)` 求解相机系→末端法兰系的变换矩阵 `T_ee_to_cam`。
 
 **标定要求**：
-- 相机视野内放置几何特征丰富的物体（非平面、有棱角）
+- 准备一块 **9×12 格子（内角点 11×8）、方格边长 10mm** 的棋盘格标定板
+- 将标定板平放在机械臂正下方工作区域中心
 - 确保机械臂运动范围内无障碍物
 - 标定结果自动保存至 `calibration_result.npz`，下次启动自动加载
 
@@ -205,11 +245,13 @@ RealSense D405
             │
             └── 与掩码融合 → 点云重心计算 → 3D 坐标 (相机系)
                                                 │
-                                         R_cam2base 变换
+                                         T_ee_to_cam 变换
                                                 │
                                          3D 坐标 (基座系)
                                                 │
-                                         机械臂运动规划
+                                         PyBullet IK 规划
+                                                │
+                                         机械臂关节控制
 ```
 
 ---
@@ -252,8 +294,9 @@ messages, final_outputs, rendered_image = agent_inference(
 | `torch` / `torchvision` | SAM3 模型推理 |
 | `numpy` | 数值计算、坐标变换 |
 | `scipy` | 旋转矩阵计算（`Rotation.from_euler`） |
-| `opencv-python` | 图像编解码、掩码处理 |
-| `open3d` | 点云处理、ICP 配准、可视化 |
+| `opencv-python` | 图像编解码、掩码处理、手眼标定 |
+| `open3d` | 点云处理、可视化 |
+| `pybullet` | PyBullet 物理引擎（IK/FK 运动学规划） |
 | `pyrealsense2` | RealSense D405 相机驱动 |
 | `requests` | 边缘端→GPU 主机 HTTP 通信 |
 | `fastapi` + `uvicorn` | SAM3 推理 HTTP 服务 |
@@ -273,6 +316,7 @@ messages, final_outputs, rendered_image = agent_inference(
 3. **server_ip 配置**：`perception_layer.py` 中的 `server_ip` 默认为 `127.0.0.1`，若推理服务部署在远程 GPU 主机，需修改为对应 IP。
 4. **工作空间限制**：机械臂有效工作半径约 0.45m，高度范围 -0.05m ~ 0.40m，超出范围会触发警告（系统仍会尝试执行）。
 5. **`ros__fixed_long_ver/` 目录**：为早期 ROS2 版本的历史存档，当前系统已完全迁移至 piper_sdk 直驱模式，无需 ROS 环境。
+6. **模型权重与标定文件**：`sam3.pt` 和 `calibration_result.npz` 均已加入 `.gitignore`，不会被提交到版本控制。
 
 ---
 

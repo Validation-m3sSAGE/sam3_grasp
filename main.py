@@ -18,7 +18,11 @@ def interactive_mode(manager):
         print("  1. 单次直接抓取   (grasp_simple)")
         print("  2. 可视化当前点云 (visualize_scene)")
         print("  3. 执行手眼标定   (calibrate)")
-        print("  h. 机械臂回零")
+        print("  4. 旋转探索并释放 (explore_and_place)")
+        print("  5. 旋转释放       (rotate_release)")
+        print("  6. 旋转探索并抓取 (explore_and_grasp)")
+        print("  7. 向右探索并释放 (explore_right_and_place)")
+        print("  h. 机械臂回归标准俯视待机位姿")
         print("  q. 退出")
         print("-" * 50)
 
@@ -40,20 +44,30 @@ def interactive_mode(manager):
             except Exception as e:
                 print(f"结果: {{'success': False, 'error': '{str(e)}'}}")
 
-        elif choice == "h":
-            result = manager.arm.go_home()
+        elif choice == "4":
+            target_place = input("寻找放置目标 (默认 trash can): ").strip() or "trash can"
+            res_place = manager.explore_and_place(target_place)
+            print(f"探索放置结果: {res_place}")
+
+        elif choice == "5":
+            angle = input("旋转角度 (默认 60): ").strip()
+            angle = float(angle) if angle else 60.0
+            result = manager.rotate_and_release(angle_deg=angle)
             print(f"结果: {result}")
 
-        elif choice == "6":
-            try:
-                manager.calibrate_axes()
-                print("结果: {'success': True}")
-            except Exception as e:
-                print(f"结果: {{'success': False, 'error': '{str(e)}'}}")
-
         elif choice == "h":
-            manager.arm.go_home()
-            print("已回零")
+            result = manager.go_standby()
+            print(f"结果: {{'success': {result}, 'action': 'go_standby'}}")
+
+        elif choice == "6":
+            target = input("寻找抓取目标 (默认 apple): ").strip() or "apple"
+            res = manager.explore_and_grasp(target)
+            print(f"结果: {res}")
+
+        elif choice == "7":
+            target_place = input("寻找放置目标 (默认 trash can): ").strip() or "trash can"
+            res_place = manager.explore_right_and_place(target_place)
+            print(f"探索向右放置结果: {res_place}")
 
         elif choice == "q":
             break
@@ -77,8 +91,8 @@ def cli_mode(args, manager):
         except Exception as e:
             result = {"success": False, "error": str(e)}
     elif mode == "go_home":
-        manager.arm.go_home()
-        result = {"success": True, "action": "go_home"}
+        manager.go_standby()
+        result = {"success": True, "action": "go_standby"}
     else:
         result = {"success": False, "error": f"未知模式: {mode}"}
 

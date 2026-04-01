@@ -4,7 +4,7 @@ import cv2
 import open3d as o3d
 import requests
 
-D405_DEPTH_MIN_MM = 70
+D405_DEPTH_MIN_MM = 10
 D405_DEPTH_MAX_MM = 1000
 
 class PerceptionLayer:
@@ -35,6 +35,37 @@ class PerceptionLayer:
         self.server_url = f"http://{server_ip}:{server_port}/predict"
         print(f"[Perception] 边缘端感知层初始化完成，远程算力挂载点: {self.server_url}")
 
+    def get_chessboard_pose(self, pattern_size=(11, 8), square_size=0.02):
+        """提取棋盘格在相机坐标系下的 6D 位姿 (默认 20mm 方格)"""
+        color_img, _ = self.get_aligned_frames()
+        if color_img is None:
+            return False, None
+            
+        gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+        # 寻找棋盘格内角点
+        ret, corners = cv2.findChessboardCorners(gray, pattern_size, None)
+        
+        if ret:
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+            corners_subpix = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+            
+            # 生成棋盘格三维物理坐标系 (Z=0 平面)
+            objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
+            objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
+            objp *= square_size
+            
+            camera_matrix = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]], dtype=np.float64)
+            dist_coeffs = np.zeros((4, 1))
+            
+            success, rvec, tvec = cv2.solvePnP(objp, corners_subpix, camera_matrix, dist_coeffs)
+            if success:
+                R, _ = cv2.Rodrigues(rvec)
+                T_cam2board = np.eye(4)
+                T_cam2board[:3, :3] = R
+                T_cam2board[:3, 3] = tvec.flatten()
+                return True, T_cam2board
+        return False, None
+
     def get_aligned_frames(self):
         frames = self.pipeline.wait_for_frames()
         aligned_frames = self.align.process(frames)
@@ -54,9 +85,10 @@ class PerceptionLayer:
         if color_img is None:
             return False, None
             
-        # 降低过滤阈值至 120mm，防止将高出桌面的目标物体（如苹果顶部）错误滤除
+        # 根据传感器尺度将物理毫米阈值逆向转换为硬件原始读数单位
+        raw_min_depth = min_depth_mm / (self.depth_scale * 1000.0)
         depth_filtered = depth_img.copy()
-        depth_filtered[depth_filtered < min_depth_mm] = 0
+        depth_filtered[depth_filtered < raw_min_depth] = 0
 
         color_rgb = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
         
@@ -133,8 +165,34 @@ class PerceptionLayer:
             print(f"[Perception] 网络请求崩溃 (主机未启动或 IP 错误): {e}")
             return False, None
 
-    def compute_pointcloud_centroid(self, mask: np.ndarray, depth_img: np.ndarray, max_points: int = 500):
-        valid_depth = (depth_img >= D405_DEPTH_MIN_MM) & (depth_img <= D405_DEPTH_MAX_MM)
+    def compute_pointcloud_centroid(self, mask: np.ndarray, depth_img: np.ndarray, color_img: np.ndarray = None, max_points: int = 500):
+        # 强制导出掩码区域内的所有原始点云（包含被判定为无效深度的点）以供排查
+        mask_v, mask_u = np.where(mask > 0)
+        if len(mask_u) > 0:
+            raw_z = depth_img[mask_v, mask_u].astype(float) * self.depth_scale
+            raw_x = (mask_u - self.cx) * raw_z / self.fx
+            raw_y = (mask_v - self.cy) * raw_z / self.fy
+            raw_points = np.stack((raw_x, raw_y, raw_z), axis=-1)
+            
+            import open3d as o3d
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(raw_points)
+            if color_img is not None:
+                colors_bgr = color_img[mask_v, mask_u]
+                colors_rgb = colors_bgr[:, ::-1] / 255.0
+                
+                # 将深度不在合法范围内的无效点强行标记为纯红色
+                invalid_mask = (depth_img[mask_v, mask_u] < D405_DEPTH_MIN_MM) | (depth_img[mask_v, mask_u] > D405_DEPTH_MAX_MM)
+                colors_rgb[invalid_mask] = [1.0, 0.0, 0.0]
+                pcd.colors = o3d.utility.Vector3dVector(colors_rgb)
+            
+            save_path = "debug_raw_masked_pointcloud.ply"
+            o3d.io.write_point_cloud(save_path, pcd)
+            print(f"[Perception] [Debug] 掩码覆盖区域的局部点云(无效深度已标红)已保存至: {save_path}")
+
+        # 将原始深度读数转换为物理毫米 (mm)，对齐常量阈值的量纲
+        depth_in_mm = depth_img.astype(float) * self.depth_scale * 1000.0
+        valid_depth = (depth_in_mm >= D405_DEPTH_MIN_MM) & (depth_in_mm <= D405_DEPTH_MAX_MM)
         target_region = (mask > 0) & valid_depth
         
         v, u = np.where(target_region)
@@ -179,7 +237,20 @@ class PerceptionLayer:
             return {'success': False, 'error': '未分割到目标'}
         print("[Perception] 目标掩码提取成功")
 
-        valid_pose, centroid = self.compute_pointcloud_centroid(mask, depth_img)
+        # 强制落盘调试图：无论后续深度是否有效，先将掩码与原图叠加并保存
+        debug_img = color_img.copy()
+        if mask is not None:
+            colored_mask = np.zeros_like(color_img)
+            colored_mask[mask > 0] = [0, 255, 0]  # 使用半透明绿色覆盖掩码区域
+            cv2.addWeighted(colored_mask, 0.4, debug_img, 0.6, 0, debug_img)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(debug_img, contours, -1, (0, 255, 0), 2)
+        debug_save_path = "debug_mask_rgb_overlay.jpg"
+        cv2.imwrite(debug_save_path, debug_img)
+        print(f"[Perception] [Debug] 掩码叠加实景图已强制保存至: {debug_save_path}")
+
+        # 传入 color_img 以便生成带有真实颜色及错误红色标记的局部点云
+        valid_pose, centroid = self.compute_pointcloud_centroid(mask, depth_img, color_img)
         if not valid_pose:
             print("[Perception] 警告: 目标区域内无有效深度，无法计算 3D 重心")
             return {'success': False, 'error': '目标区域无深度'}
@@ -219,10 +290,12 @@ class PerceptionLayer:
         return result
 
     def visualize_current_pointcloud(self):
-        """获取当前帧点云并调用 Open3D 窗口渲染"""
+        """获取当前帧点云并保存到本地（支持无头环境）"""
         success, pcd = self.get_scene_pointcloud(downsample_voxel=0.005)
         if success and pcd is not None:
-            o3d.visualization.draw_geometries([pcd], window_name="Current Scene PointCloud")
+            save_path = "current_scene_pointcloud.ply"
+            o3d.io.write_point_cloud(save_path, pcd)
+            print(f"[Perception] 点云数据已保存至当前目录: {save_path}")
             return True
         return False
 

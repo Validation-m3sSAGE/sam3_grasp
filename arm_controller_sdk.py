@@ -4,6 +4,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 from piper_sdk import C_PiperInterface_V2
 
+import os
+import numpy as np
+from ompl_planner import OMPLKinematicsPlanner
+
 class PiperArmControllerSDK:
     """
     基于官方 Piper SDK 的机械臂控制器，用于替换 ROS2 版本。
@@ -21,7 +25,10 @@ class PiperArmControllerSDK:
         self.is_enabled = False
         self._last_gripper_cmd = self.HOME_JOINTS[6]
         
-        print(f"[SDK] Piper CAN 总线 ({can_port}) 初始化完成，等待底层状态反馈...")
+        urdf_path = os.path.join(os.path.dirname(__file__), "urdf", "piper_description.urdf")
+        self.planner = OMPLKinematicsPlanner(urdf_path)
+        
+        print(f"[SDK] Piper CAN 总线 ({can_port}) 初始化完成，OMPL 物理引擎已挂载...")
         time.sleep(1.0)
         
     def enable_arm(self, enable: bool = True, wait: float = 1.0):
@@ -75,6 +82,11 @@ class PiperArmControllerSDK:
         return True
 
     def set_pose(self, x: float, y: float, z: float, roll: float = 0.0, pitch: float = 1.5708, yaw: float = 0.0, gripper: float = None, wait: bool = True, duration: float = 2.0) -> bool:
+        """
+        全量接管为 OMPL/关节空间轨迹规划:
+        将 Cartesian 目标坐标经过本地 URDF 物理引擎离线逆解，映射为无奇异的高维关节角度流形，
+        并调用 set_joints 进行安全插补，彻底规避硬件固件中的笛卡尔坐标越界报错。
+        """
         if not self.is_enabled:
             self.enable_arm(True)
 
@@ -84,51 +96,31 @@ class PiperArmControllerSDK:
             gripper = float(gripper) if gripper >= 0.0 else 0.0
             self._last_gripper_cmd = gripper
 
-        # 国际单位制映射至 SDK 微单位制
-        factor_len = 1000000.0
-        factor_deg = 57295.7795
-        
-        X = round(x * factor_len)
-        Y = round(y * factor_len)
-        Z = round(z * factor_len)
-        RX = round(roll * factor_deg)
-        RY = round(pitch * factor_deg)
-        RZ = round(yaw * factor_deg)
+        try:
+            current_joints = self.current_joints[:6]
+            target_joints = self.planner.solve_ik(
+                target_pos=[x, y, z],
+                target_rpy=[roll, pitch, yaw],
+                current_joints=current_joints
+            )
+        except Exception as e:
+            print(f"[Planner Error] OMPL/IK 离线引擎解算失败: {e}")
+            return False
 
-        # 切换至笛卡尔(P)控制模式 0x00，使用平滑速度 50
-        self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
-        self.piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+        full_target_joints = np.append(target_joints, gripper)
         
-        gripper_cmd = round(gripper * factor_len)
-        self.piper.GripperCtrl(gripper_cmd, 1000, 0x01, 0)
+        print(f"[Planner] 坐标投影成功 ({x:.3f}, {y:.3f}, {z:.3f}) -> 映射关节域: {np.round(target_joints, 2)}")
         
-        if wait:
-            time.sleep(duration)
-            T_curr = self.get_current_pose_matrix()
-            curr_x, curr_y, curr_z = T_curr[:3, 3]
-            pos_error = np.sqrt((curr_x - x)**2 + (curr_y - y)**2 + (curr_z - z)**2)
-            if pos_error > 0.03:
-                print(f"[SDK Error] 运动学异常拦截: 目标({x:.3f}, {y:.3f}, {z:.3f}), "
-                      f"实际滞留点({curr_x:.3f}, {curr_y:.3f}, {curr_z:.3f}), 误差 {pos_error:.3f}m")
-                return False
-        return True
+        # 抛弃固件层的 EndPoseCtrl 笛卡尔模式，依赖可靠的关节驱动域完成物理移动
+        return self.set_joints(full_target_joints, speed_pct=25, duration=duration, wait=wait)
 
     def get_current_pose_matrix(self) -> np.ndarray:
-        msg = self.piper.GetArmEndPoseMsgs().end_pose
-        # SDK 逆向解算，还原标准米与弧度
-        x = msg.X_axis / 1000000.0
-        y = msg.Y_axis / 1000000.0
-        z = msg.Z_axis / 1000000.0
-        rx = math.radians(msg.RX_axis / 1000.0)
-        ry = math.radians(msg.RY_axis / 1000.0)
-        rz = math.radians(msg.RZ_axis / 1000.0)
-        
-        T = np.eye(4)
-        T[0, 3] = x
-        T[1, 3] = y
-        T[2, 3] = z
-        T[:3, :3] = R.from_euler('xyz', [rx, ry, rz]).as_matrix()
-        return T
+        """使用 OMPL/PyBullet 物理引擎进行纯数学正向解算，与 IK 绝对对齐"""
+        if hasattr(self, 'planner'):
+            current_joints = self.current_joints[:6]
+            return self.planner.solve_fk(current_joints)
+        else:
+            return np.eye(4)
 
     def wait_for_pose(self, timeout: float = 5.0) -> bool:
         t0 = time.time()
@@ -154,4 +146,10 @@ class PiperArmControllerSDK:
 
     def destroy_node(self):
         # 兼容 ROS 框架的析构调用
+        if hasattr(self, 'planner'):
+            self.planner.destroy()
         self.piper.DisconnectPort()
+
+if __name__ == "__main__":
+    pas = PiperArmControllerSDK()
+    pas.set_gripper(0.9)

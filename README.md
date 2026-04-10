@@ -1,6 +1,6 @@
 # SAM3 × Piper 机械臂抓取系统
 
-基于 Meta **SAM3**（Segment Anything Model 3）视觉大模型与松灵 **Piper** 机械臂的**零样本语言驱动抓取系统**。系统通过文本描述定位目标物体，结合 Intel RealSense D405 深度相机完成三维坐标解算，驱动机械臂执行精准抓取，并通过 **MCP（Model Context Protocol）** 将全部能力暴露为 AI Agent 可直接调用的工具。
+基于 Meta **SAM3**（Segment Anything Model 3）视觉大模型与松灵 **Piper** 机械臂的**零样本语言驱动抓取系统**。系统通过文本描述定位目标物体，结合 Intel RealSense D405 深度相机完成三维坐标解算，驱动机械臂执行精准抓取。系统已原生接入 **PhyAgentOS** 具身智能操作系统，并保留了对 **MCP（Model Context Protocol）** 的兼容支持。
 
 ---
 
@@ -47,7 +47,8 @@
 | **OMPL 运动规划** | 基于 PyBullet 物理引擎的 IK/FK 解算，将笛卡尔目标坐标映射为安全的关节空间轨迹 |
 | **自动抓取** | 完整的预抓取→下放→夹取→复位动作链，支持 45° 斜向下抓取姿态 |
 | **探索抓取** | 旋转扫描环境，发现目标后自动对准并执行抓取 |
-| **MCP 工具接口** | 通过 Model Context Protocol 将抓取能力暴露为 AI Agent 可调用的工具 |
+| **PhyAgentOS 接入** | 原生支持作为 PhyAgentOS 开放模块接入，支持 Critic 安全校验与任务分解 |
+| **MCP 工具接口** | 保留对 Model Context Protocol 的兼容，将抓取能力暴露为独立工具 |
 | **Agentic 分割** | 内置多轮 MLLM 推理 Agent，支持复杂指代表达的精确分割 |
 
 ---
@@ -56,6 +57,12 @@
 
 ```
 SAM3/
+├── phyagentos_driver.py       # PhyAgentOS 驱动实现（核心接入点）
+├── phyagentos_bridge_server.py# PhyAgentOS 远程模式 HTTP 桥接服务
+├── PhyAgentOS_plugin.toml     # PhyAgentOS 插件注册配置
+├── register_to_phyagentos.py  # 快捷注册脚本
+├── profiles/                  # 机器人能力描述文件
+│   └── sam3_piper.md          # 供 Critic 校验的 EMBODIED.md 模板
 ├── main.py                    # 主入口（交互菜单 / CLI 模式）
 ├── mcp_server.py              # MCP 服务端（供 AI Agent 调用）
 ├── server_sam3.py             # SAM3 GPU 推理 HTTP 服务
@@ -176,37 +183,84 @@ python main.py --mode visualize_scene
 python main.py --calib /path/to/calibration_result.npz --mode grasp_simple --target bottle
 ```
 
-### 5c. MCP Agent 模式（推荐）
+### 5c. PhyAgentOS 模式（推荐）
 
-通过 `launch_sam3_system.sh` 一键启动完整系统（CAN 激活 + 推理服务 + MCP 服务端）：
+SAM3 系统已原生支持作为 **PhyAgentOS 开放模块（External Plugin Driver）** 接入。接入后，PhyAgentOS 的 AgentLoop 可以直接控制 SAM3 + Piper 系统执行抓取任务，并支持任务分解、Critic 安全校验和状态持久化。
+
+#### 注册插件（一次性）
+
+在 PhyAgentOS 环境中执行以下命令，将 SAM3 注册为驱动插件：
 
 ```bash
-bash launch_sam3_system.sh
+cd /path/to/PhyAgentOS
+python -c "
+from hal.plugins import register_plugin
+spec = register_plugin('/path/to/SAM3')
+print('Plugin registered:', spec.driver_name)
+"
 ```
 
-该脚本会：
-1. 激活 CAN 总线
-2. 后台启动 `server_sam3.py`（等待 HTTP 服务就绪后再继续）
-3. 前台启动 `mcp_server.py`（接管 stdio，供 AI Agent 调用）
+> **提示**：如果你觉得命令行注册比较麻烦，也可以直接运行 SAM3 目录下的 `register_to_phyagentos.py` 脚本（需指定 PhyAgentOS 的路径）。
 
-在支持 MCP 的 AI Agent（如 OEA、Claude Desktop 等）中配置此工具后，可通过自然语言指令控制机械臂：
+#### 启动方式
+
+**方式一：本地模式（PhyAgentOS 与 SAM3 在同一台机器）**
+
+```bash
+conda activate sam3_grasp
+python -m hal.hal_watchdog \
+    --driver sam3_piper \
+    --workspace ~/.PhyAgentOS/workspace \
+    --interval 1.0
+```
+
+**方式二：远程模式（PhyAgentOS 在控制主机，SAM3 在机械臂机器）**
+
+1. 在机械臂机器上启动桥接服务：
+   ```bash
+   conda activate sam3_grasp
+   python phyagentos_bridge_server.py --port 18791
+   ```
+
+2. 在控制主机上创建 `sam3_remote.json`：
+   ```json
+   {
+     "mode": "remote",
+     "bridge_url": "http://<机械臂机器IP>:18791"
+   }
+   ```
+
+3. 在控制主机上启动 Watchdog：
+   ```bash
+   python -m hal.hal_watchdog \
+       --driver sam3_piper \
+       --driver-config /path/to/sam3_remote.json \
+       --workspace ~/.PhyAgentOS/workspace
+   ```
+
+在支持的 AI Agent（如 OEA）中，可通过自然语言指令控制机械臂：
 
 > "帮我抓取桌上的苹果"  
 > "检查视野中是否有水瓶"  
 > "执行手眼标定"  
 > "把夹着的东西放到垃圾桶里"
 
-#### MCP 工具列表
+#### 支持的动作 (Action Types)
 
-| 工具名 | 功能 |
-|--------|------|
-| `grasp_simple` | 直接抓取指定目标物体 |
-| `explore_and_grasp` | 向右旋转扫描，发现目标后执行抓取 |
-| `explore_and_place` | 向左旋转扫描，发现目标后在其上方释放 |
-| `explore_right_and_place` | 向右旋转扫描，发现目标后在其上方释放 |
-| `check_target` | 检查指定目标是否在当前视野中 |
-| `calibrate_axes` | 执行多位姿 AX=XB 手眼标定 |
-| `go_home` | 机械臂回归标准俯视待机位姿 |
+| 动作名 | 参数 | 功能 |
+|--------|------|------|
+| `grasp` | `target_name: str` | 直接抓取指定目标物体 |
+| `explore_and_grasp` | `target_name: str` | 向右旋转扫描，发现目标后执行抓取 |
+| `explore_and_place` | `target_name: str` | 向左旋转扫描，发现目标后在其上方释放 |
+| `explore_right_and_place` | `target_name: str` | 向右旋转扫描，发现目标后在其上方释放 |
+| `check_target` | `target_name: str` | 检查指定目标是否在当前视野中 |
+| `calibrate` | — | 执行多位姿 AX=XB 手眼标定 |
+| `go_home` | — | 机械臂回归标准俯视待机位姿 |
+| `connect` / `disconnect` | — | 使能/关闭机械臂 |
+
+### 5d. MCP Agent 模式（旧版兼容）
+
+系统仍保留了对 MCP（Model Context Protocol）的支持。通过 `launch_sam3_system.sh` 可一键启动完整系统（CAN 激活 + 推理服务 + MCP 服务端）。
 
 ---
 

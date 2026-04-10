@@ -1,0 +1,16 @@
+# PhyAgentOS Plugin Manifest — SAM3 Piper Grasping System
+# This file is read by `hal.plugins.register_plugin()` to install the driver.
+
+[plugin]
+name    = "sam3_piper"
+version = "1.0.0"
+
+[driver]
+name         = "sam3_piper"
+module       = "phyagentos_driver"
+class        = "SAM3PiperDriver"
+profile_path = "profiles/sam3_piper.md"
+
+[python]
+# Directories (relative to this repo root) to prepend to sys.path
+sys_paths = ["."]

@@ -249,8 +249,8 @@ class GraspManager:
         
         # 放宽安全半径至 0.46m。由于底层 OMPL 规划器已经具备完善的运动学和关节限位阻断，
         # 我们不需要在这里做过于保守的软拦截，直接交由 IK 引擎判断是否可达。
-        if target_radius > 0.46:
-            print(f"[Error] 目标距离 ({target_radius:.3f}m) 超过 0.46m 的绝对物理臂展，已放弃抓取。")
+        if target_radius > 0.66:
+            print(f"[Error] 目标距离 ({target_radius:.3f}m) 超过 0.66m 的绝对物理臂展，已放弃抓取。")
             return {'success': False, 'error': 'Target too far, grasp aborted'}
             
         effective_retract = TCP_TOOL_LEN - GRASP_PENETRATION
@@ -473,11 +473,15 @@ class GraspManager:
         self.arm.set_pose(0.25, 0.0, 0.32, pitch=2.35619, yaw=0.0, wait=True, duration=2.5)
         time.sleep(1.0)
         
-        current_yaw = 0.0
+        current_yaw = 0.5236*3
         # 强制向右转：底座减去固定弧度 (0.5236rad 约 30度)
         step_angle = -0.5236 
         total_steps = 12
         base_joints = self.arm.current_joints.copy()
+        rotate_joints = base_joints.copy()
+        rotate_joints[0] = current_yaw
+        self.arm.set_joints(rotate_joints, speed_pct=15, duration=2.0)
+        time.sleep(2.0)
         found = False
         import math
         
